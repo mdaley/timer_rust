@@ -7,15 +7,17 @@ pub struct TriggeredWorker {
 }
 
 impl TriggeredWorker {
-    #[allow(dead_code)]
     pub fn new() -> Self {
         Self {
             tx_: None
         }
     }
 
-    #[allow(dead_code)]
-    pub fn start(&mut self) {
+    pub fn start<F: 'static + Fn() + Send>(&mut self, work: F) {
+        if self.tx_.is_some() {
+            panic!("Can't start work when work is already in progress.");
+        }
+
         let channel: (Sender<bool>, Receiver<bool>) = mpsc::channel();
         let (tx, rx) = channel;
         self.tx_ = Some(tx);
@@ -25,39 +27,34 @@ impl TriggeredWorker {
                     Ok(do_work) => {
                         match do_work {
                             true => {
-                                println!("Work done!");
+                                work();
                             }
                             false => {
-                                println!("Stopping");
                                 break;
                             }
                         }
                     }
-                    Err(_error) => {
-                        // channel hung up -> stop
-                        break;
+                    Err(error) => {
+                        panic!(error);
                     }
                 }
             }
         });
     }
 
-    #[allow(dead_code)]
     pub fn stop(&mut self) {
         if let Some(s) = self.tx_.as_ref() {
             match s.send(false) {
                 Ok(_result) => {
                     self.tx_ = None;
                 }
-                Err(_error) => {
-                    // log an error and just get rid of the transmitter.
-                    self.tx_ = None;
+                Err(error) => {
+                    panic!(error);
                 }
             }
         }
     }
 
-    #[allow(dead_code)]
     pub fn trigger(&mut self) {
         if let Some(s) = self.tx_.as_ref() {
             match s.send(true) {
@@ -80,37 +77,99 @@ mod tests {
     use crate::timer::TriggeredWorker;
     use std::time::Duration;
     use std::thread;
+    use std::sync::atomic::{AtomicI32, AtomicBool};
+    use std::sync::atomic::Ordering::Relaxed;
+    use std::sync::Arc;
 
     #[test]
-    fn construct() {
+    #[should_panic]
+    fn work_can_only_be_started_once() {
         let mut worker = TriggeredWorker::new();
-        assert!(!worker.is_running());
-        worker.start();
-        assert!(worker.is_running());
-        worker.stop();
-        assert!(!worker.is_running());
+        worker.start(|| {});
+        worker.start(|| {});
     }
 
     #[test]
-    fn do_some_work() {
-        let mut work = TriggeredWorker::new();
-        work.start();
-        thread::sleep(Duration::from_secs(5));
-        work.trigger();
-        thread::sleep(Duration::from_secs(20));
+    fn can_start_stop_and_then_start_worker() {
+        let done_some_work = Arc::new(AtomicBool::new(false));
+        let internal_done_some_work = done_some_work.clone();
+        let mut worker = TriggeredWorker::new();
+        worker.start(|| {});
+        worker.stop();
+        worker.start(move || {
+            internal_done_some_work.store(true, Relaxed);
+        });
+        worker.trigger();
+        thread::sleep(Duration::from_millis(10));
+
+        worker.stop();
+        assert!(done_some_work.load(Relaxed));
+    }
+
+    #[test]
+    fn one_piece_of_work_can_be_triggered() {
+        let done_some_work = Arc::new(AtomicBool::new(false));
+        let mut worker = TriggeredWorker::new();
+
+        assert!(!worker.is_running());
+
+        let internal_done_some_work = done_some_work.clone();
+        worker.start(move || {
+            internal_done_some_work.store(true, Relaxed);
+        });
+
+        assert!(worker.is_running());
+
+        worker.trigger();
+
+        // make sure worker has time to run!
+        thread::sleep(Duration::from_millis(10));
+
+        worker.stop();
+
+        assert!(!worker.is_running());
+        assert!(done_some_work.load(Relaxed));
+    }
+
+    #[test]
+    fn nothing_happens_if_work_is_not_triggered() {
+        let done_some_work = Arc::new(AtomicBool::new(false));
+
+        let mut worker = TriggeredWorker::new();
+
+        let internal_done_some_work = done_some_work.clone();
+        worker.start(move|| {
+            internal_done_some_work.store(true, Relaxed);
+        });
+
+        thread::sleep(Duration::from_millis(10));
+
+        worker.stop();
+
+        assert!(!worker.is_running());
+        assert!(!done_some_work.load(Relaxed));
+
     }
 
     #[test]
     fn do_lots_of_work() {
-        let mut work = TriggeredWorker::new();
-        work.start();
+        let work_count = Arc::new(AtomicI32::new(0));
+        let mut worker = TriggeredWorker::new();
+        let internal_work_count = work_count.clone();
 
-        for _i in 1..1000 {
-            thread::sleep(Duration::from_millis(10));
-            work.trigger();
+        worker.start(move|| {
+            internal_work_count.fetch_add(1, Relaxed);
+        });
+
+        for _i in 0..1000 {
+            worker.trigger();
         }
 
-        thread::sleep(Duration::from_secs(5));
+        thread::sleep(Duration::from_millis(10));
+
+        worker.stop();
+
+        assert_eq!(work_count.load(Relaxed), 1000);
     }
 }
 
