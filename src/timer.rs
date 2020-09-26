@@ -15,10 +15,12 @@ impl TriggeredWorker {
 
     pub fn start<F: 'static + Fn() + Send>(&mut self, work: F) {
         if self.tx_.is_some() {
-            panic!("Can't start work when work is already in progress.");
+            println!("*** can't start");
+            return;
         }
 
         let channel: (Sender<bool>, Receiver<bool>) = mpsc::channel();
+
         let (tx, rx) = channel;
         self.tx_ = Some(tx);
         thread::spawn(move || {
@@ -35,7 +37,7 @@ impl TriggeredWorker {
                         }
                     }
                     Err(error) => {
-                        panic!(error);
+                        println!("*** {}", error.to_string());
                     }
                 }
             }
@@ -43,6 +45,10 @@ impl TriggeredWorker {
     }
 
     pub fn stop(&mut self) {
+        if self.tx_.is_none() {
+            panic!("Can't stop an already stopped worker! You must start it first.");
+        }
+
         if let Some(s) = self.tx_.as_ref() {
             match s.send(false) {
                 Ok(_result) => {
@@ -56,11 +62,15 @@ impl TriggeredWorker {
     }
 
     pub fn trigger(&mut self) {
+        if self.tx_.is_none() {
+            panic!("Can't trigger on a worker that is not running.");
+        }
+
         if let Some(s) = self.tx_.as_ref() {
             match s.send(true) {
                 Ok(_result) => {}
-                Err(_error) => {
-                    // log an error
+                Err(error) => {
+                    panic!(error);
                 }
             }
         }
@@ -76,17 +86,52 @@ impl TriggeredWorker {
 mod tests {
     use crate::timer::TriggeredWorker;
     use std::time::Duration;
-    use std::thread;
+    use std::{thread, panic};
     use std::sync::atomic::{AtomicI32, AtomicBool};
     use std::sync::atomic::Ordering::Relaxed;
     use std::sync::Arc;
 
+    // Tidy up test output by hiding panic traces and just showing to_string output.
+    fn hide_panic<F: Fn()>(ftn: F) {
+        let std_panic_hook = panic::take_hook();
+        panic::set_hook(Box::new(|a| {
+            println!("{}", a.to_string());
+        }));
+        ftn();
+        panic::set_hook(std_panic_hook);
+    }
+
     #[test]
-    #[should_panic]
+    //#[should_panic (expected = "already started")]
     fn work_can_only_be_started_once() {
-        let mut worker = TriggeredWorker::new();
-        worker.start(|| {});
-        worker.start(|| {});
+        hide_panic(|| {
+            let mut worker = TriggeredWorker::new();
+            worker.start(|| { println!("worker 1"); });
+            //thread::sleep(Duration::from_millis(100));
+            worker.start(|| { println!("worker 2"); });
+
+            worker.stop();
+        });
+    }
+
+    #[test]
+    #[should_panic (expected = "already stopped")]
+    fn work_can_only_be_stopped_once() {
+        //hide_panic(|| {
+            let mut worker = TriggeredWorker::new();
+            worker.start(|| {});
+            worker.stop();
+            worker.stop();
+        //});
+    }
+
+    #[test]
+    #[should_panic (expected = "not running")]
+    fn can_not_trigger_on_a_worker_that_is_not_running() {
+        hide_panic(|| {
+            let mut worker = TriggeredWorker::new();
+            worker.trigger();
+        });
     }
 
     #[test]
