@@ -1,6 +1,17 @@
+extern crate custom_error;
+
+use custom_error::custom_error;
 use std::sync::mpsc;
 use std::thread;
-use std::sync::mpsc::{Sender, Receiver};
+use std::sync::mpsc::{Receiver, SendError, Sender};
+use crate::timer::TimerError::{AlreadyStopped, NotRunning, AlreadyStarted};
+
+custom_error! {#[derive(PartialEq)] pub TimerError
+    AlreadyStopped = "Cannot stop an already stopped worker",
+    AlreadyStarted = "Cannot start and already started worker",
+    NotRunning = "Cannot trigger on a worker that is not running",
+    SendFailure{source: SendError<bool>} = "Cannot send message"
+}
 
 pub struct TriggeredWorker {
     tx_: Option<Sender<bool>>
@@ -13,10 +24,9 @@ impl TriggeredWorker {
         }
     }
 
-    pub fn start<F: 'static + Fn() + Send>(&mut self, work: F) {
+    pub fn start<F: 'static + Fn() + Send>(&mut self, work: F) -> Result<(), TimerError> {
         if self.tx_.is_some() {
-            println!("*** can't start");
-            return;
+            Err(AlreadyStarted)?
         }
 
         let channel: (Sender<bool>, Receiver<bool>) = mpsc::channel();
@@ -36,17 +46,20 @@ impl TriggeredWorker {
                             }
                         }
                     }
-                    Err(error) => {
-                        println!("*** {}", error.to_string());
+                    Err(_error) => {
+                        // maybe do logging? Can't report back as this thread just ends. Not using
+                        // the JoinHandle... Right or wrong?
                     }
                 }
             }
         });
+
+        Ok(())
     }
 
-    pub fn stop(&mut self) {
+    pub fn stop(&mut self) -> Result<(), TimerError> {
         if self.tx_.is_none() {
-            panic!("Can't stop an already stopped worker! You must start it first.");
+            Err(AlreadyStopped)?
         }
 
         if let Some(s) = self.tx_.as_ref() {
@@ -55,25 +68,29 @@ impl TriggeredWorker {
                     self.tx_ = None;
                 }
                 Err(error) => {
-                    panic!(error);
+                    Err(error)?
                 }
             }
         }
+
+        Ok(())
     }
 
-    pub fn trigger(&mut self) {
+    pub fn trigger(&mut self) -> Result<(), TimerError> {
         if self.tx_.is_none() {
-            panic!("Can't trigger on a worker that is not running.");
+            Err(NotRunning)?
         }
 
         if let Some(s) = self.tx_.as_ref() {
             match s.send(true) {
                 Ok(_result) => {}
                 Err(error) => {
-                    panic!(error);
+                    Err(error)?
                 }
             }
         }
+
+        Ok(())
     }
 
     #[allow(dead_code)]
@@ -89,49 +106,52 @@ mod tests {
     use std::{thread, panic};
     use std::sync::atomic::{AtomicI32, AtomicBool};
     use std::sync::atomic::Ordering::Relaxed;
-    use std::sync::Arc;
-
-    // Tidy up test output by hiding panic traces and just showing to_string output.
-    fn hide_panic<F: Fn()>(ftn: F) {
-        let std_panic_hook = panic::take_hook();
-        panic::set_hook(Box::new(|a| {
-            println!("{}", a.to_string());
-        }));
-        ftn();
-        panic::set_hook(std_panic_hook);
-    }
+    use std::sync::{Arc, mpsc};
+    use crate::timer::TimerError::{AlreadyStopped, SendFailure, NotRunning, AlreadyStarted};
+    use std::sync::mpsc::{SendError};
 
     #[test]
-    //#[should_panic (expected = "already started")]
     fn work_can_only_be_started_once() {
-        hide_panic(|| {
-            let mut worker = TriggeredWorker::new();
-            worker.start(|| { println!("worker 1"); });
-            //thread::sleep(Duration::from_millis(100));
-            worker.start(|| { println!("worker 2"); });
-
-            worker.stop();
-        });
+        let mut worker = TriggeredWorker::new();
+        let _ = worker.start(|| {});
+        assert_eq!(worker.start(|| {}).unwrap_err(), AlreadyStarted);
     }
 
     #[test]
-    #[should_panic (expected = "already stopped")]
     fn work_can_only_be_stopped_once() {
-        //hide_panic(|| {
-            let mut worker = TriggeredWorker::new();
-            worker.start(|| {});
-            worker.stop();
-            worker.stop();
-        //});
+        let mut worker = TriggeredWorker::new();
+        let _ = worker.start(|| {});
+        assert!(worker.stop().is_ok());
+        assert_eq!(worker.stop().unwrap_err(), AlreadyStopped);
     }
 
     #[test]
-    #[should_panic (expected = "not running")]
+    fn stopping_when_channel_already_stopped_results_in_error() {
+        let mut worker = TriggeredWorker::new();
+        let _ = worker.start(|| {});
+
+        // give the worker a different sender that isn't linked via the channel to the receiver
+        // in the worker's thread. This makes the channel close because the previous sender is
+        // dropped. However, there is a sender available so that stop() doesn't immediately fail
+        // with AlreadyStopped.
+        worker.tx_ = Some(mpsc::channel().0);
+        assert_eq!(worker.stop(), Err(SendFailure { source: SendError(false) }));
+
+    }
+
+    #[test]
     fn can_not_trigger_on_a_worker_that_is_not_running() {
-        hide_panic(|| {
-            let mut worker = TriggeredWorker::new();
-            worker.trigger();
-        });
+        let mut worker = TriggeredWorker::new();
+        assert_eq!(worker.trigger().unwrap_err(), NotRunning);
+    }
+
+    #[test]
+    fn trigger_fails_if_channel_has_broken() {
+        let mut worker = TriggeredWorker::new();
+        let _ = worker.start(|| {});
+
+        worker.tx_ = Some(mpsc::channel().0);
+        assert_eq!(worker.trigger(), Err(SendFailure { source: SendError(true) }));
     }
 
     #[test]
@@ -139,15 +159,15 @@ mod tests {
         let done_some_work = Arc::new(AtomicBool::new(false));
         let internal_done_some_work = done_some_work.clone();
         let mut worker = TriggeredWorker::new();
-        worker.start(|| {});
-        worker.stop();
-        worker.start(move || {
+        let _ = worker.start(|| {});
+        let _ = worker.stop();
+        let _ = worker.start(move || {
             internal_done_some_work.store(true, Relaxed);
         });
-        worker.trigger();
+        let _ = worker.trigger();
         thread::sleep(Duration::from_millis(10));
 
-        worker.stop();
+        let _ = worker.stop();
         assert!(done_some_work.load(Relaxed));
     }
 
@@ -159,18 +179,18 @@ mod tests {
         assert!(!worker.is_running());
 
         let internal_done_some_work = done_some_work.clone();
-        worker.start(move || {
+        let _ = worker.start(move || {
             internal_done_some_work.store(true, Relaxed);
         });
 
         assert!(worker.is_running());
 
-        worker.trigger();
+        let _ = worker.trigger();
 
         // make sure worker has time to run!
         thread::sleep(Duration::from_millis(10));
 
-        worker.stop();
+        let _ = worker.stop();
 
         assert!(!worker.is_running());
         assert!(done_some_work.load(Relaxed));
@@ -183,13 +203,13 @@ mod tests {
         let mut worker = TriggeredWorker::new();
 
         let internal_done_some_work = done_some_work.clone();
-        worker.start(move|| {
+        let _ = worker.start(move|| {
             internal_done_some_work.store(true, Relaxed);
         });
 
         thread::sleep(Duration::from_millis(10));
 
-        worker.stop();
+        let _ = worker.stop();
 
         assert!(!worker.is_running());
         assert!(!done_some_work.load(Relaxed));
@@ -202,17 +222,17 @@ mod tests {
         let mut worker = TriggeredWorker::new();
         let internal_work_count = work_count.clone();
 
-        worker.start(move|| {
+        let _ = worker.start(move|| {
             internal_work_count.fetch_add(1, Relaxed);
         });
 
         for _i in 0..1000 {
-            worker.trigger();
+            let _ = worker.trigger();
         }
 
         thread::sleep(Duration::from_millis(10));
 
-        worker.stop();
+        let _ = worker.stop();
 
         assert_eq!(work_count.load(Relaxed), 1000);
     }

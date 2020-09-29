@@ -18,21 +18,21 @@ fn main() {
 
     let ii = i.clone();
     let thread_time = time.clone();
-    worker.start(move || {
+    let _ = worker.start(move || {
         let d = Instant::now();
         ii.fetch_add(1, Relaxed);
         thread_time.fetch_add(d.elapsed().as_nanos() as u64, Relaxed);
     });
 
     for _i in 0..100000 {
-        worker.trigger();
+        let _ = worker.trigger();
     }
 
     thread::sleep(Duration::from_millis(10));
 
     println!("Work done count = {}", i.load(Relaxed));
     println!("Total thread time = {}ns", time.load(Relaxed));
-    worker.stop();
+    let _ = worker.stop();
 
     thread::sleep(Duration::from_millis(1));
 }
